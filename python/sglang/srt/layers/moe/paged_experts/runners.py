@@ -284,8 +284,6 @@ class MarlinContract(RunnerContract):
 
 
 class XpuContract(RunnerContract):
-    # Online FP8 quantizes one expert at a time in the base method's post-load step.
-    repacks = True
     # The native XPU FP8 grouped GEMM requires the expert table to have this alignment.
     slot_alignment = 8
 

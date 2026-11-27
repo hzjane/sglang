@@ -194,7 +194,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self._create_runner(layer)
         # The XPU FP8 method calls its native kernel directly, bypassing its Triton runner.
         self.contract = contract_for(
-            self.runner, native_xpu=isinstance(self.format, Fp8OnlineFormat)
+            self.runner, native_xpu=torch.get_default_device().type == "xpu"
         )
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
         # Loads wait as views of the mapped checkpoint: the post-load step replays them K
@@ -254,7 +254,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             layer,
             self.base_method,
             self.loads,
-            self.contract.repacks,
+            self.contract.repacks or isinstance(self.format, Fp8OnlineFormat),
             self.format.unpaged,
         )
         cache = self._expert_cache(layer)
@@ -457,7 +457,7 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
     requested = _requested_num_resident()  # None: auto
     if requested is None:
         alignment = (
-            XPU.slot_alignment if isinstance(expert_format, Fp8OnlineFormat) else 1
+            XPU.slot_alignment if torch.get_default_device().type == "xpu" else 1
         )
         num_resident = min(round_up(_router_top_k(layer), alignment), num_experts)
     else:
@@ -577,7 +577,10 @@ def check_paged_experts_compat(layer, expert_format) -> None:
                     f"{flag} needs an explicit --paged-experts-num-resident, not auto"
                 )
     if expert_format is None and xpu:
-        problems.append(f"XPU paged experts requires {Fp8OnlineFormat.label}")
+        problems.append(
+            f"XPU paged experts requires {Fp8OnlineFormat.label} or an FP8 checkpoint "
+            "with 128x128 block scales"
+        )
     elif expert_format is None:
         problems.append(
             f"{type(layer.quant_method).__name__} experts are not supported; supported are "

@@ -7,9 +7,9 @@ after the base method's post-load step are paged. A format names only what that 
 see: tensors its runner never reads (``unpaged``) and tensors created for other runners
 (``freed``).
 
-Whether the post-load step repacks the experts follows from the runner (``repacks`` of its
-contract). A repack runs over the loaded experts K at a time (``PostLoad``), so it must treat
-every expert on its own, which is checked; any other step must leave them as loaded.
+The post-load step repacks experts for runners that require it and for online FP8
+quantization. A repack runs over the loaded experts K at a time (``PostLoad``), so it must
+treat every expert on its own, which is checked; any other step must leave them as loaded.
 
 Adding a quantization method means adding a subclass to ``FORMATS``.
 """
@@ -195,7 +195,7 @@ class PostLoad:
             )
         for name, host in store.host.items():
             gpu = getattr(layer, name).data[0]
-            if not torch.equal(gpu, host[0].to(gpu.device)):
+            if not same_bytes(gpu, host[0].to(gpu.device)):
                 raise RuntimeError(
                     f"Paged experts: {type(base_method).__name__} transforms {name} after "
                     "loading, which the host store does not replicate"
@@ -493,9 +493,13 @@ FORMATS = (
 def format_for(layer, base_method) -> Optional[ExpertFormat]:
     scheme = getattr(layer, "scheme", None)
     if torch.get_default_device().type == "xpu":
-        return (
-            Fp8OnlineFormat() if Fp8OnlineFormat.supports(base_method, scheme) else None
-        )
+        if Fp8OnlineFormat.supports(base_method, scheme):
+            return Fp8OnlineFormat()
+        if Fp8BlockFormat.supports(base_method, scheme) and tuple(
+            base_method.quant_config.weight_block_size
+        ) == (128, 128):
+            return Fp8BlockFormat()
+        return None
     for fmt in FORMATS:
         if fmt.supports(base_method, scheme):
             return fmt()

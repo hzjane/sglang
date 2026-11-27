@@ -1,4 +1,4 @@
-"""Single-XPU paging of experts quantized from BF16 at load time."""
+"""Single-XPU paging of online and block-quantized FP8 experts."""
 
 import sys
 from dataclasses import replace
@@ -31,7 +31,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _load_layer(weights, *, paged, graph=False):
+@pytest.fixture(params=[False, True], ids=["online", "block"])
+def block_fp8(request):
+    return request.param
+
+
+def _load_layer(weights, block_fp8, *, paged, graph=False, no_combine=False):
     args = ServerArgs(
         model_path="dummy",
         device="xpu",
@@ -51,7 +56,10 @@ def _load_layer(weights, *, paged, graph=False):
             layer_id=0,
             top_k=4,
             params_dtype=torch.bfloat16,
-            quant_config=Fp8Config(is_checkpoint_fp8_serialized=False),
+            quant_config=Fp8Config(
+                is_checkpoint_fp8_serialized=block_fp8,
+                weight_block_size=[128, 128] if block_fp8 else None,
+            ),
             uses_expert_location=False,
         )
     for name, shard, rows in weights:
@@ -59,22 +67,32 @@ def _load_layer(weights, *, paged, graph=False):
         for expert, row in enumerate(rows):
             param.weight_loader(param, row, name, shard, expert_id=expert)
     layer.quant_method.process_weights_after_loading(layer)
+    if no_combine:
+        layer.quant_method.moe_runner_config = replace(
+            layer.quant_method.moe_runner_config,
+            no_combine=True,
+            no_combine_keep_router_weight=True,
+        )
     return layer
 
 
-def _checkpoint_weights(rng):
-    return [
-        (
-            name,
-            shard,
-            torch.randn((16, *shape), generator=rng, dtype=torch.bfloat16) * 0.05,
-        )
-        for name, shard, shape in (
-            ("w13_weight", "w1", (128, 256)),
-            ("w13_weight", "w3", (128, 256)),
-            ("w2_weight", "w2", (256, 128)),
-        )
-    ]
+def _checkpoint_weights(rng, block_fp8):
+    weights = []
+    for name, shard, shape in (
+        ("w13_weight", "w1", (128, 256)),
+        ("w13_weight", "w3", (128, 256)),
+        ("w2_weight", "w2", (256, 128)),
+    ):
+        rows = torch.randn((16, *shape), generator=rng, dtype=torch.bfloat16)
+        if block_fp8:
+            rows = (rows * 32).to(torch.float8_e4m3fn)
+            blocks = tuple(dim // 128 for dim in shape)
+            scales = torch.rand((16, *blocks), generator=rng) * 0.002 + 0.0005
+            weights.append((f"{name}_scale_inv", shard, scales))
+        else:
+            rows = rows * 0.05
+        weights.append((name, shard, rows))
+    return weights
 
 
 def _dispatch(ids, rng):
@@ -89,23 +107,33 @@ def _dispatch(ids, rng):
     return StandardDispatchOutput(x, None, topk)
 
 
+def _reference_output(layer, dispatch):
+    method = layer.quant_method
+    output = method.apply(layer, dispatch).hidden_states
+    if method.moe_runner_config.no_combine:
+        output = output.sum(dim=1, dtype=torch.float32).to(torch.bfloat16)
+    return output
+
+
 @torch.inference_mode()
-def test_online_fp8_multiple_waves():
+def test_fp8_multiple_waves(block_fp8):
     rng = torch.Generator().manual_seed(8)
-    weights = _checkpoint_weights(rng)
+    weights = _checkpoint_weights(rng, block_fp8)
     reset_context()
     try:
-        reference = _load_layer(weights, paged=False)
-        paged = _load_layer(weights, paged=True)
+        # Match the per-entry BF16 rounding before the block-FP8 top-k sum.
+        reference = _load_layer(weights, block_fp8, paged=False, no_combine=block_fp8)
+        paged = _load_layer(weights, block_fp8, paged=True)
         assert paged.w13_weight.shape[0] == paged.w2_weight.shape[0] == 8
         assert paged.w13_weight.dtype == torch.float8_e4m3fn
         assert paged.w2_weight.dtype == torch.float8_e4m3fn
         host = paged.quant_method.store.host
+        scale = "weight_scale_inv" if block_fp8 else "weight_scale"
         assert set(host) == {
             "w13_weight",
             "w2_weight",
-            "w13_weight_scale",
-            "w2_weight_scale",
+            f"w13_{scale}",
+            f"w2_{scale}",
         }
         for name, rows in host.items():
             assert rows.is_pinned()
@@ -121,7 +149,7 @@ def test_online_fp8_multiple_waves():
         first = [[0, 3, 6, 10], [1, 3, -1, 10]]
         for ids in (first, [[2, 9, 12, 15], [0, 3, 11, 14], [6, 4, -1, 13]], first):
             dispatch = _dispatch(ids, rng)
-            expected = reference.quant_method.apply(reference, dispatch).hidden_states
+            expected = _reference_output(reference, dispatch)
             actual = paged.quant_method.apply(paged, dispatch).hidden_states
             # Top-1 outputs round to BF16 before the framework's FP32 reduction.
             torch.testing.assert_close(actual, expected, atol=5e-4, rtol=0.01)
@@ -130,25 +158,16 @@ def test_online_fp8_multiple_waves():
 
 
 @torch.inference_mode()
-def test_online_fp8_decode_graph_replay():
+def test_fp8_decode_graph_replay(block_fp8):
     rng = torch.Generator().manual_seed(16)
-    weights = _checkpoint_weights(rng)
+    weights = _checkpoint_weights(rng, block_fp8)
     reset_context()
     graph = torch.xpu.XPUGraph()
     try:
-        reference = _load_layer(weights, paged=False)
-        reference.quant_method.moe_runner_config = replace(
-            reference.quant_method.moe_runner_config,
-            no_combine=True,
-            no_combine_keep_router_weight=True,
-        )
-        paged = _load_layer(weights, paged=True, graph=True)
+        reference = _load_layer(weights, block_fp8, paged=False, no_combine=True)
+        paged = _load_layer(weights, block_fp8, paged=True, graph=True)
         method = paged.quant_method
         residency = method.device_executor.residency
-
-        def expected_output(dispatch):
-            entries = reference.quant_method.apply(reference, dispatch).hidden_states
-            return entries.sum(dim=1, dtype=torch.float32).to(torch.bfloat16)
 
         static = _dispatch([[0, 1, 2, 3], [4, 5, 6, 7]], rng)
         stream = torch.xpu.Stream()
@@ -166,14 +185,14 @@ def test_online_fp8_decode_graph_replay():
             graph.replay()
             torch.xpu.synchronize()
             assert residency.count.item() == expected_copies
-            expected = expected_output(misses)
+            expected = _reference_output(reference, misses)
             torch.testing.assert_close(captured, expected, atol=5e-4, rtol=0.01)
 
         # A larger step uses host-planned waves, grows the eager workspace, and
         # hands the new residency back to the next replay.
         prefill = _dispatch([[2, 3, 4, 5], [6, 7, 8, 9], [10, 11, 12, 13]] * 5, rng)
         actual = method.apply(paged, prefill).hidden_states
-        expected = expected_output(prefill)
+        expected = _reference_output(reference, prefill)
         torch.testing.assert_close(actual, expected, atol=5e-4, rtol=0.01)
 
         for ids in ([[0, 15, 5, 14], [4, 12, -1, 3]], [[-1] * 4] * 2):
@@ -182,7 +201,7 @@ def test_online_fp8_decode_graph_replay():
             static.topk_output.topk_ids.copy_(dispatch.topk_output.topk_ids)
             graph.replay()
             torch.xpu.synchronize()
-            expected = expected_output(dispatch)
+            expected = _reference_output(reference, dispatch)
             torch.testing.assert_close(captured, expected, atol=5e-4, rtol=0.01)
             slots = residency.slot_expert.cpu().long()
             for name, host in method.store.host.items():
