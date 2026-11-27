@@ -87,7 +87,10 @@ class HostExpertStore:
     method may rebind them after loading.
     """
 
-    def __init__(self, rows: RowsLike, num_experts: int):
+    def __init__(
+        self, rows: RowsLike, num_experts: int, *, device: Optional[torch.device] = None
+    ):
+        self.device = device
         self.host: Dict[str, torch.Tensor] = {
             name: self._alloc((num_experts, *shape), dtype)
             for name, (shape, dtype) in rows.items()
@@ -96,6 +99,12 @@ class HostExpertStore:
     def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
         if math.prod(shape) == 0:
             return torch.empty(shape, dtype=dtype, device="cpu")
+        if self.device is not None and self.device.type == "xpu":
+            from sglang.srt.mem_cache.pool_host.common import alloc_with_pin_memory_xpu
+
+            return alloc_with_pin_memory_xpu(
+                dims=shape, dtype=dtype, device="cpu", pin_memory=True, allocator=None
+            )
         return _pin_until_freed(shape, dtype)
 
     @contextlib.contextmanager

@@ -3427,6 +3427,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            routed_shape = None
+            if moe_runner_config.no_combine:
+                # The XPU kernel reduces top-k even with no_combine. Route one expert
+                # per row so the caller receives every entry in its original order.
+                routed_shape = topk_ids.shape
+                if x.shape[0] == 0:
+                    return StandardCombineInput(
+                        hidden_states=x.new_empty((*routed_shape, x.shape[-1]))
+                    )
+                if routed_shape[1] > 1:
+                    x = x.repeat_interleave(routed_shape[1], dim=0)
+                if not moe_runner_config.no_combine_keep_router_weight:
+                    topk_weights = torch.ones_like(topk_weights)
+                topk_weights = topk_weights.reshape(-1, 1)
+                topk_ids = topk_ids.reshape(-1, 1)
             topk_weights, topk_ids = route_dropped_experts_to_local(
                 topk_weights=topk_weights, topk_ids=topk_ids
             )
@@ -3455,11 +3470,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     else layer.w2_weight_scale
                 ),
                 activation=moe_runner_config.activation,
-                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                routed_scaling_factor=(
+                    moe_runner_config.routed_scaling_factor
+                    if routed_shape is None
+                    else None
+                ),
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,
                 swiglu_limit=moe_runner_config.swiglu_limit,
             )
+            if routed_shape is not None:
+                output = output.reshape(*routed_shape, output.shape[-1])
             return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_cutlass():

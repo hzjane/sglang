@@ -22,18 +22,21 @@ from sglang.srt.layers.moe.paged_experts.expert_cache import ExpertCache, fill_s
 from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
     ExpertFormat,
+    Fp8OnlineFormat,
     PostLoad,
     expert_params,
     format_for,
 )
 from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
 from sglang.srt.layers.moe.paged_experts.runners import (
+    XPU,
     contract_for,
     runner_config,
     runner_of,
 )
 from sglang.srt.layers.moe.paged_experts.store import ExpertLoads
 from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -56,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     process_model_config,
 )
+from sglang.srt.utils.common import round_up
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +192,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config  # rebuilt with the final K
         self._create_runner(layer)
-        self.contract = contract_for(self.runner)
+        # The XPU FP8 method calls its native kernel directly, bypassing its Triton runner.
+        self.contract = contract_for(
+            self.runner, native_xpu=isinstance(self.format, Fp8OnlineFormat)
+        )
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
         # Loads wait as views of the mapped checkpoint: the post-load step replays them K
         # experts at a time.
@@ -226,7 +233,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def _expert_cache(self, layer) -> Optional[ExpertCache]:
         """The layer's expert cache entry, once its checkpoint files are loaded: for a layer
         of more than K experts, with --paged-experts-enable-disk."""
-        if self.num_experts <= self.num_resident:
+        if self.num_experts <= self.num_resident or self.contract is XPU:
             return None
         rows = self.loads.rows_like
         if not get_exec().moe.paged_experts_enable_disk:
@@ -448,9 +455,13 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
     check_paged_experts_compat(layer=layer, expert_format=expert_format)
     num_experts = layer.num_local_experts
     requested = _requested_num_resident()  # None: auto
-    num_resident = min(
-        requested if requested is not None else _router_top_k(layer), num_experts
-    )
+    if requested is None:
+        alignment = (
+            XPU.slot_alignment if isinstance(expert_format, Fp8OnlineFormat) else 1
+        )
+        num_resident = min(round_up(_router_top_k(layer), alignment), num_experts)
+    else:
+        num_resident = min(requested, num_experts)
     if requested is not None:  # auto caps once K is sized
         _cap_decode_capture_batch_sizes(num_resident // _router_top_k(layer))
     return PagedExpertsMoEMethod(
@@ -498,23 +509,37 @@ def check_paged_experts_compat(layer, expert_format) -> None:
 
     problems = []
     parallel = get_parallel()
+    moe = get_exec().moe
+    xpu = torch.get_default_device().type == "xpu"
     for name in ("tp_size", "ep_size", "pp_size", "dp_size"):
         if getattr(parallel, name) > 1:
             problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
-    if get_exec().moe.enable_eplb:
+    if moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
     if get_spec().speculative_algorithm:
         problems.append("speculative decoding is not supported")
     # Host-planned waves run as eager breaks in a breakable prefill graph; a full graph only
     # captures steps that fit one wave, which decode can be limited to and prefill cannot.
-    if not (
+    if xpu:
+        if not cuda_graph_fully_disabled():
+            problems.append("XPU prefill and decode graphs must be disabled")
+        if (
+            moe.paged_experts_enable_disk
+            or moe.paged_experts_host_memory_gb is not None
+        ):
+            problems.append("XPU paged experts only supports pinned host memory")
+        if not get_moe_runner_backend().is_auto():
+            problems.append("XPU paged experts requires --moe-runner-backend auto")
+        if layer.moe_runner_config.params_dtype != torch.bfloat16:
+            problems.append("the native XPU FP8 MoE runner requires --dtype bfloat16")
+    elif not (
         check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
         or check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
     ):
         problems.append(
             "prefill CUDA graphs must use the breakable backend or be disabled"
         )
-    if not (
+    if not xpu and not (
         check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
         or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
     ):
@@ -530,6 +555,16 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         problems.append(
             f"--paged-experts-num-resident must be at least the router's top-k ({top_k})"
         )
+    if xpu:
+        alignment = XPU.slot_alignment
+        slots = min(
+            num_resident if num_resident is not None else round_up(top_k, alignment),
+            layer.num_local_experts,
+        )
+        if slots < top_k or slots % alignment:
+            problems.append(
+                f"the XPU expert slot count must be a multiple of {alignment}"
+            )
     if num_resident is None:
         # These bind the slot tables before auto sizes them, or allocate them elsewhere.
         for flag, enabled in (
@@ -541,12 +576,14 @@ def check_paged_experts_compat(layer, expert_format) -> None:
                 problems.append(
                     f"{flag} needs an explicit --paged-experts-num-resident, not auto"
                 )
-    if expert_format is None:
+    if expert_format is None and xpu:
+        problems.append(f"XPU paged experts requires {Fp8OnlineFormat.label}")
+    elif expert_format is None:
         problems.append(
             f"{type(layer.quant_method).__name__} experts are not supported; supported are "
             + ", ".join(fmt.label for fmt in FORMATS)
         )
-    if get_exec().moe.enable_fused_moe_sum_all_reduce:
+    if moe.enable_fused_moe_sum_all_reduce:
         problems.append(
             "--enable-fused-moe-sum-all-reduce is not supported: paged experts sums the "
             "top-k outputs itself"

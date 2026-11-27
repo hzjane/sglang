@@ -273,6 +273,7 @@ class ExpertSlotSizing:
             )
         # On the disk tier a layer grows to its host rows at most.
         ks = self._grow(base, [m.max_resident for m in methods], row, spare)
+        ks = [k - k % m.contract.slot_alignment for k, m in zip(ks, methods)]
         slab = self._allocate(ks, methods)
         offset = 0
         for layer, m, k in zip(self.layers, methods, ks):

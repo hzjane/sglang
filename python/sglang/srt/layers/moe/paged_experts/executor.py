@@ -99,7 +99,7 @@ class EagerExecutor:
         to_slot = torch.full((len(waves), self.num_experts + 1), -1, dtype=torch.int32)
         for w, wave in enumerate(waves):
             to_slot[w, wave.experts] = torch.tensor(wave.slots, dtype=torch.int32)
-        if topk_ids.is_cuda:
+        if topk_ids.device.type in ("cuda", "xpu"):
             to_slot = to_slot.pin_memory()
         to_slot = to_slot.to(topk_ids.device, non_blocking=True)
         for w, wave in enumerate(waves):

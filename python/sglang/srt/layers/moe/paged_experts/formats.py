@@ -255,7 +255,8 @@ def build_store(
                 continue
             first = step.run(experts)  # also gives the paged layout
             if store is None:
-                store = HostExpertStore(step.rows_like, num_experts)
+                device = getattr(step.layer, next(iter(first))).device
+                store = HostExpertStore(step.rows_like, num_experts, device=device)
             for name, rows in first.items():
                 store.host[name][: len(experts)].copy_(rows)
             first = rows = None  # the next chunk's run builds another K-slot table
@@ -291,6 +292,24 @@ class Fp8BlockFormat(ExpertFormat):
             and base_method.quant_config.is_checkpoint_fp8_serialized
             and not base_method.use_mxfp8
             and not base_method.is_fp4_expert
+        )
+
+
+class Fp8OnlineFormat(ExpertFormat):
+    """BF16/FP16 checkpoint quantized to per-expert FP8 during loading."""
+
+    label = "online FP8 (a BF16/FP16 checkpoint with --quantization fp8)"
+
+    @classmethod
+    def supports(cls, base_method, scheme) -> bool:
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        return (
+            isinstance(base_method, Fp8MoEMethod)
+            and not base_method.block_quant
+            and not base_method.is_fp4_expert
+            and not base_method.quant_config.is_checkpoint_fp8_serialized
+            and base_method.quant_config.activation_scheme == "dynamic"
         )
 
 
@@ -473,6 +492,10 @@ FORMATS = (
 
 def format_for(layer, base_method) -> Optional[ExpertFormat]:
     scheme = getattr(layer, "scheme", None)
+    if torch.get_default_device().type == "xpu":
+        return (
+            Fp8OnlineFormat() if Fp8OnlineFormat.supports(base_method, scheme) else None
+        )
     for fmt in FORMATS:
         if fmt.supports(base_method, scheme):
             return fmt()

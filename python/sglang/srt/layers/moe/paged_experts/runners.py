@@ -52,6 +52,7 @@ class RunnerContract:
     #: Whether the runner reads a layout the base method's post-load step repacks the
     #: experts into; the step then runs over the host store K experts at a time.
     repacks: bool = False
+    slot_alignment: int = 1
 
     def run_wave(
         self, base_method, layer, dispatch_output, slots, merged, num_entries=None
@@ -282,8 +283,34 @@ class MarlinContract(RunnerContract):
         moe_sum_reduce(entries, out, routed_scaling_factor)
 
 
+class XpuContract(RunnerContract):
+    # Online FP8 quantizes one expert at a time in the base method's post-load step.
+    repacks = True
+    # The native XPU FP8 grouped GEMM requires the expert table to have this alignment.
+    slot_alignment = 8
+
+    def compacts(self, base_method, layer, dispatch_output) -> bool:
+        return _unquantized_inputs(dispatch_output)
+
+    def run_wave(
+        self, base_method, layer, dispatch_output, slots, merged, num_entries=None
+    ):
+        assert self.compacts(base_method, layer, dispatch_output), (
+            "Paged experts: the XPU FP8 runner needs BF16 MoE inputs"
+        )
+        for entries in _compact_calls(slots, num_entries):
+            merged = _run_compacted(
+                base_method, layer, dispatch_output, slots, entries, merged
+            )
+        return merged
+
+    def _sum_top_k(self, entries, out, routed_scaling_factor: float) -> None:
+        out.copy_(entries.sum(dim=1, dtype=torch.float32).mul_(routed_scaling_factor))
+
+
 TRITON = TritonContract()
 MARLIN = MarlinContract()
+XPU = XpuContract()
 
 
 def runner_of(base_method, layer):
@@ -296,8 +323,10 @@ def runner_of(base_method, layer):
     return None
 
 
-def contract_for(runner) -> RunnerContract:
+def contract_for(runner, *, native_xpu: bool = False) -> RunnerContract:
     """The contract of the runner the base method built for paged experts."""
+    if native_xpu:
+        return XPU
     backend = getattr(runner, "runner_backend", None)
     if backend is not None and backend.is_triton():
         return TRITON

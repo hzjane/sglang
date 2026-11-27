@@ -1163,7 +1163,8 @@ class ExecMoe(msgspec.Struct):
         "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
         "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
-        "graphs must be breakable or disabled.",
+        "graphs must be breakable or disabled. XPU supports eager online FP8 "
+        "(BF16/FP16 checkpoint, --quantization fp8, --dtype bfloat16) from pinned host memory.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
