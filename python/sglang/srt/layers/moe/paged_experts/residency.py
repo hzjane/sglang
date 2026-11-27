@@ -109,7 +109,7 @@ class DeviceResidency:
         host = torch.tensor(
             slot_expert + lastuse + [base + k] + expert_slot, dtype=torch.int32
         )
-        if self.step.is_cuda:
+        if self.step.device.type in ("cuda", "xpu"):
             host = host.pin_memory()
         host = host.to(self.step.device, non_blocking=True)
         states = (self.slot_expert, self.slot_lastuse, self.step, self.expert_slot)

@@ -521,8 +521,8 @@ def check_paged_experts_compat(layer, expert_format) -> None:
     # Host-planned waves run as eager breaks in a breakable prefill graph; a full graph only
     # captures steps that fit one wave, which decode can be limited to and prefill cannot.
     if xpu:
-        if not cuda_graph_fully_disabled():
-            problems.append("XPU prefill and decode graphs must be disabled")
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            problems.append("XPU prefill graphs must be disabled")
         if (
             moe.paged_experts_enable_disk
             or moe.paged_experts_host_memory_gb is not None
@@ -539,11 +539,11 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         problems.append(
             "prefill CUDA graphs must use the breakable backend or be disabled"
         )
-    if not xpu and not (
+    if not (
         check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
         or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
     ):
-        problems.append("decode CUDA graphs must use the full backend or be disabled")
+        problems.append("decode graphs must use the full backend or be disabled")
     load_format = _load_format()
     if load_format not in _LOAD_FORMATS:
         problems.append(

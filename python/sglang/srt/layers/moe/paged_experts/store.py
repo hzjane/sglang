@@ -127,6 +127,9 @@ class HostExpertStore:
     def bind_device_gather(self, layer) -> None:
         """Prepare ``gather``; called once the layer's tensors are final. The gather kernel
         reads the pinned store directly, through its UVA address."""
+        if self.device is not None and self.device.type == "xpu":
+            self._bind_xpu_gather(layer)
+            return
         from sglang.kernels.ops.moe.paged_experts import (
             paged_experts_host_device_pointer,
         )
@@ -151,6 +154,34 @@ class HostExpertStore:
             for v in (hosts, gpus, sizes)
         ]
 
+    def _bind_xpu_gather(self, layer) -> None:
+        from sglang.srt.mem_cache.pool_host.common import make_kernel_ptr_table
+
+        hosts, tables, row_words = [], [], []
+        for name, host in self.host.items():
+            table = getattr(layer, name).data
+            row_bytes = host[0].numel() * host.element_size()
+            if not row_bytes:
+                continue
+            if not (
+                host.is_pinned()
+                and host.is_contiguous()
+                and table.is_contiguous()
+                and row_bytes % 4 == 0
+            ):
+                raise RuntimeError(
+                    "Paged experts: XPU graphs need contiguous pinned expert rows "
+                    f"aligned to four bytes; got {row_bytes} bytes per row for {name}"
+                )
+            hosts.append(host)
+            tables.append(table)
+            row_words.append(row_bytes // 4)
+        self._gather_args = (
+            make_kernel_ptr_table(hosts, self.device, host_memory_registered=False),
+            make_kernel_ptr_table(tables, self.device, host_memory_registered=False),
+            tuple(row_words),
+        )
+
     def bind(self, layer, device_planned: bool) -> None:
         """Prepare the transfers once the layer's tensors are final; with
         ``device_planned``, steps are also decided on the GPU (``gather``)."""
@@ -167,7 +198,10 @@ class HostExpertStore:
         """Copy expert ``src[i]`` into GPU slot ``dst[i]`` for ``i < count[0]``, with every
         index read on the GPU (a device-planned step): capturable in a CUDA graph. ``blocks``:
         the copy's grid (narrow beside compute)."""
-        from sglang.kernels.ops.moe.paged_experts import paged_experts_gather
+        if self.device is not None and self.device.type == "xpu":
+            from sglang.kernels.ops.moe.paged_experts_xpu import paged_experts_gather
+        else:
+            from sglang.kernels.ops.moe.paged_experts import paged_experts_gather
 
         paged_experts_gather(*self._gather_args, src, dst, count, blocks=blocks)
 

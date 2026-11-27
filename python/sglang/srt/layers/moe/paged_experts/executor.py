@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils.device import is_device_stream_capturing
 
 
 class EagerExecutor:
@@ -53,7 +54,7 @@ class EagerExecutor:
         if r is not None:
             join(r)  # a pre-copy into this layer finishes before it reads the residency
             maybe_log()  # pre-copy counters, also from breakable-graph breaks (prefill)
-        if r is not None and torch.cuda.is_current_stream_capturing():
+        if r is not None and is_device_stream_capturing(r.step.device):
             raise RuntimeError(
                 "Paged experts: a captured decode batch routes more entries than the K "
                 "resident slots; capture batch sizes must stay at or below K // top_k"
@@ -147,13 +148,19 @@ class DeviceExecutor:
         self.residency = residency
         self.contract = contract
         self.routed_scaling_factor = routed_scaling_factor
+        self._xpu = residency.step.device.type == "xpu"
+        self._captured_moe_workspace = {}
         # The next MoE layer's pre-copy, launched after this layer's gather; set by
         # ``precopy.install``.
         self.precopy_next = None
 
     def run(self, layer, dispatch_output):
-        from sglang.kernels.ops.moe.paged_experts import paged_experts_decide
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if self._xpu:
+            from sglang.kernels.ops.moe.paged_experts_xpu import paged_experts_decide
+        else:
+            from sglang.kernels.ops.moe.paged_experts import paged_experts_decide
 
         r = self.residency
         join(r)  # a pre-copy into this layer finishes before its decide
@@ -175,7 +182,8 @@ class DeviceExecutor:
             run_w.view(-1),
         )
         self.store.gather(src=r.src, dst=r.dst, count=r.count)
-        if not torch.cuda.is_current_stream_capturing():
+        capturing = is_device_stream_capturing(r.step.device)
+        if not capturing:
             # Not a graph replay: page in what the gather left on disk before the GEMM.
             self.store.resolve_pending()
         pre = self.precopy_next
@@ -194,6 +202,13 @@ class DeviceExecutor:
         partial = self.base_method.apply(
             layer=layer, dispatch_output=wave_output
         ).hidden_states
+        if self._xpu and capturing:
+            from sgl_kernel import moe
+
+            # A larger eager prefill can replace the wheel's grow-only buffers.
+            # Keep the addresses recorded by this layer's graphs alive.
+            for buffer in getattr(moe, "_moe_ws_cache", {}).values():
+                self._captured_moe_workspace[id(buffer)] = buffer
         return StandardCombineInput(
             hidden_states=self.contract.finish(
                 merged=partial,

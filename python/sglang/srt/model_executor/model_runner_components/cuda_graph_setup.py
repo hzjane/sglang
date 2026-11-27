@@ -760,7 +760,11 @@ def capture_decode_graph(
     *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
 ) -> GraphCapture:
     """Capture device graphs."""
-    if get_exec().moe.enable_paged_experts and not model_runner.is_draft_worker:
+    if (
+        get_exec().moe.enable_paged_experts
+        and not model_runner.is_draft_worker
+        and not current_platform.is_xpu
+    ):
         from sglang.srt.layers.moe.paged_experts.precopy import install
 
         # The paged executors are final (sizing ran with the memory pool): link the
